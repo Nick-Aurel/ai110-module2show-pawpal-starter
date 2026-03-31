@@ -77,11 +77,30 @@ classDiagram
 
 **a. Initial design**
 
-My initial UML matches **Step 2** and **Step 3**: separate **data** (Owner → Pet → Task) from **behavior** (**DailyPlanner** builds one day’s plan under time and priority constraints and supplies explanations). The core story is **Owner has Pets**, each **Pet** carries the **Task** backlog for scheduling, and the planner is the only object whose job is to order and justify work for that day.
+I chose four classes so the domain stays clear: **who** (owner and pet), **what work exists** (tasks), and **how a day is built** (planner). Responsibilities:
+
+- **Owner** — Stores identity and scheduling inputs: name, how many minutes are available today, and optional preferences. It owns the list of **Pet** objects for this app (`add_pet` / `get_pets`) and exposes `available_minutes()` so the planner can respect the time budget.
+- **Pet** — Stores the animal's name and species and holds the **Task** backlog for the current session (`add_task` / `get_tasks`). It can point back to its **Owner** so explanations and UI stay consistent.
+- **Task** — One unit of care work: title, duration, priority. Helper methods (`duration`, `priority_rank`, `summary`) support sorting and display without putting all display logic in the UI.
+- **DailyPlanner** — Stateless service that reads an **Owner**, a **Pet**, and a task list, then will produce a plan plus reasons (`build_plan`, `explain_placement`). It does not own pets or tasks; it depends on them (as in the UML dependency arrows).
+
+Structurally, this separates **data** (Owner → Pet → Task) from **behavior** (planning in **DailyPlanner**). The Mermaid diagram in Step 3 matches this split.
 
 **b. Design changes**
 
-Implementation is still evolving from the starter Streamlit shell in `app.py`, but I already expect at least one refinement relative to my first sketch. I initially thought **DailyPlan** could be “just a list of **Task** in order,” but explaining the plan requires each line to carry **when** it happens and **why** it was chosen or placed there. So I will likely introduce a separate concept (e.g. **ScheduledItem** or **PlanEntry**) that wraps a **Task** with a **start time** (or slot) and an **explanation** string, and make **DailyPlan** aggregate those instead of raw tasks only. That change keeps the domain model honest: a backlog **Task** is not the same thing as a placed item on the day’s timeline.
+**Planned model tweak (output shape):** I still expect to add something like **ScheduledItem** / **PlanEntry** (task + start time or slot + explanation) once the scheduler is real, because a backlog **Task** is not the same as a placed item on the timeline. That is separate from the four-class UML, which stays the core blueprint.
+
+**Refinements after reviewing `pawpal_system.py` (Step 5):** I had an AI assistant review the skeleton and applied small fixes so relationships and accessors match the UML intent:
+
+- **Bidirectional Owner ↔ Pet:** Empty `add_pet` stubs risked an owner's list and a pet's `owner` field getting out of sync. `add_pet` now appends the pet to the owner and sets `pet.owner = self`.
+- **Pet ↔ Task:** `add_task` / `get_tasks` now append and return the pet's task list instead of no-ops, so the backlog is usable from code and tests.
+- **Getter stubs:** `get_pets`, `get_tasks`, and `available_minutes` used to fall through with `pass` and would have returned `None` by mistake; they now return the underlying values.
+- **Task helpers:** `duration`, `priority_rank`, and `summary` are implemented with simple rules so sorting and UI strings work; unknown priority strings default to a middle rank.
+- **Potential bottleneck (documented, not a bug):** `build_plan(owner, pet, tasks)` takes both `pet` and a separate `tasks` list. That could duplicate `pet.tasks` if callers are careless. The class docstring notes that callers should pass the same tasks they associate with the pet (e.g. `pet.get_tasks()`) until we refactor to a single source of truth.
+- **Scheduling still TODO:** `DailyPlanner.build_plan` and `explain_placement` remain unimplemented on purpose until the scheduling phase.
+
+Implementation in `app.py` is still the starter shell; wiring the UI to these classes is the next step.
+
 
 ---
 
