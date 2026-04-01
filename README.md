@@ -57,6 +57,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+Use the command above. Running `python app.py` does not start Streamlit’s server (you would see “missing ScriptRunContext” warnings); the app exits with a short reminder to use `streamlit run`.
+
 ## Testing PawPal+
 
 Run the automated tests from the project root:
