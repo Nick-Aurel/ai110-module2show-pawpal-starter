@@ -2,28 +2,57 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
+
+
+def _due_time_to_minutes(value: Optional[str]) -> int:
+    """Minutes since midnight for sorting; missing/invalid sorts last."""
+    if not value or not str(value).strip():
+        return 24 * 60 + 1
+    try:
+        parts = str(value).strip().split(":")
+        h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        return h * 60 + m
+    except (ValueError, IndexError):
+        return 24 * 60 + 1
 
 
 @dataclass
 class Task:
-    """One pet care item: title, duration, and priority."""
+    """One pet care item: title, duration, priority, optional due time / recurrence."""
 
     title: str
     duration_minutes: int
     priority: str
     completed: bool = False
+    due_time: Optional[str] = None  # "HH:MM" (24h) for sorting & conflict checks
+    recurrence: Optional[str] = None  # "daily", "weekly", or None
+    due_date: Optional[date] = None  # anchor for spawning the next recurring instance
 
     def __post_init__(self) -> None:
-        """Validate duration and normalize priority to low, medium, or high."""
+        """Validate duration, priority, optional due_time and recurrence."""
         if self.duration_minutes <= 0:
             raise ValueError("duration_minutes must be positive")
         normalized = self.priority.strip().lower()
         if normalized not in {"low", "medium", "high"}:
             raise ValueError("priority must be one of: low, medium, high")
         self.priority = normalized
+        if self.due_time is not None and str(self.due_time).strip():
+            dt = str(self.due_time).strip()
+            if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", dt):
+                raise ValueError(f"due_time must be HH:MM (24h), got {dt!r}")
+            h, m = dt.split(":")
+            self.due_time = f"{int(h):02d}:{int(m):02d}"
+        else:
+            self.due_time = None
+        if self.recurrence is not None:
+            r = self.recurrence.strip().lower()
+            if r not in {"daily", "weekly"}:
+                raise ValueError("recurrence must be 'daily', 'weekly', or None")
+            self.recurrence = r
 
     def duration(self) -> int:
         """Return this task's duration in minutes."""
@@ -37,11 +66,30 @@ class Task:
     def summary(self) -> str:
         """Return a short human-readable line for display."""
         status = "done" if self.completed else "pending"
-        return f"{self.title} ({self.duration_minutes} min, {self.priority}, {status})"
+        when = f", due {self.due_time}" if self.due_time else ""
+        rec = f", {self.recurrence}" if self.recurrence else ""
+        return f"{self.title} ({self.duration_minutes} min, {self.priority}{when}{rec}, {status})"
 
     def mark_complete(self) -> None:
         """Mark this task as completed."""
         self.completed = True
+
+    def spawn_next_occurrence(self) -> Task:
+        """Create the next pending instance for a daily/weekly recurring task."""
+        if self.recurrence not in {"daily", "weekly"}:
+            raise ValueError("spawn_next_occurrence requires recurrence daily or weekly")
+        base = self.due_date or date.today()
+        delta = 1 if self.recurrence == "daily" else 7
+        next_d = base + timedelta(days=delta)
+        return Task(
+            title=self.title,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            completed=False,
+            due_time=self.due_time,
+            recurrence=self.recurrence,
+            due_date=next_d,
+        )
 
 
 @dataclass
@@ -60,6 +108,18 @@ class Pet:
     def get_tasks(self) -> list[Task]:
         """Return a shallow copy of this pet's tasks."""
         return list(self.tasks)
+
+    def finalize_recurring_task(self, task: Task) -> Optional[Task]:
+        """Mark task complete; if daily/weekly, append the next occurrence."""
+        if task not in self.tasks:
+            raise ValueError("task must belong to this pet")
+        if not task.recurrence:
+            task.mark_complete()
+            return None
+        task.mark_complete()
+        nxt = task.spawn_next_occurrence()
+        self.add_task(nxt)
+        return nxt
 
 
 @dataclass
@@ -100,14 +160,71 @@ class Scheduler:
     be used from tests and the Streamlit UI.
     """
 
+    def sort_tasks_by_time(self, tasks: list[Task]) -> list[Task]:
+        """Return tasks sorted by ``due_time`` (HH:MM); tasks without time sort last."""
+        return sorted(
+            tasks,
+            key=lambda t: (_due_time_to_minutes(t.due_time), t.title.lower()),
+        )
+
+    def filter_by_completion(self, tasks: list[Task], completed: Optional[bool] = None) -> list[Task]:
+        """Keep all tasks, or only completed / only pending when ``completed`` is set."""
+        if completed is None:
+            return list(tasks)
+        return [t for t in tasks if t.completed is completed]
+
+    def tasks_for_pet_name(self, owner: Owner, pet_name: str) -> list[Task]:
+        """Return a copy of tasks for the first pet whose name matches (case-insensitive)."""
+        needle = pet_name.strip().lower()
+        for pet in owner.get_pets():
+            if pet.name.lower() == needle:
+                return pet.get_tasks()
+        return []
+
+    def find_due_time_conflicts(self, tasks: list[Task]) -> list[str]:
+        """Warn when two or more pending tasks share the same ``due_time`` (lightweight)."""
+        pending = [t for t in tasks if not t.completed and t.due_time]
+        by_time: dict[str, list[str]] = {}
+        for t in pending:
+            by_time.setdefault(t.due_time, []).append(t.title)
+        notes: list[str] = []
+        for hhmm, titles in sorted(by_time.items(), key=lambda x: _due_time_to_minutes(x[0])):
+            if len(titles) > 1:
+                names = ", ".join(sorted(titles))
+                notes.append(
+                    f"Due-time conflict at {hhmm}: multiple tasks want that slot ({names}). "
+                    "Adjust times or priorities so the owner can do one thing at a time."
+                )
+        return notes
+
+    def detect_plan_overlaps(self, plan: list[dict[str, Any]]) -> list[str]:
+        """Detect overlapping intervals in a built plan (sanity check; should usually be empty)."""
+        notes: list[str] = []
+        intervals: list[tuple[int, int, str]] = []
+        for row in plan:
+            s = datetime.strptime(row["start"], "%H:%M")
+            e = datetime.strptime(row["end"], "%H:%M")
+            sm = s.hour * 60 + s.minute
+            em = e.hour * 60 + e.minute
+            intervals.append((sm, em, row["task"]))
+        intervals.sort(key=lambda x: x[0])
+        for i in range(1, len(intervals)):
+            prev_end = intervals[i - 1][1]
+            cur_start, _, cur_title = intervals[i]
+            if cur_start < prev_end:
+                notes.append(
+                    f"Scheduled overlap: '{intervals[i - 1][2]}' and '{cur_title}' both occupy time."
+                )
+        return notes
+
     def build_plan(
         self,
         owner: Owner,
         pet: Optional[Pet] = None,
         tasks: Optional[list[Task]] = None,
         start_time: str = "08:00",
-    ) -> list[dict[str, Any]]:
-        """Build an ordered schedule dict for the owner within their time budget."""
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Build an ordered schedule and return ``(plan_rows, warning_messages)``."""
         if tasks is not None:
             source_tasks = list(tasks)
         elif pet is not None:
@@ -115,10 +232,18 @@ class Scheduler:
         else:
             source_tasks = owner.get_all_tasks()
 
-        # Prioritize by (priority desc, duration asc, title asc) for stable output.
+        warnings = list(self.find_due_time_conflicts(source_tasks))
+
+        pending = [task for task in source_tasks if not task.completed]
+        # Order: earlier due_time first, then higher priority, shorter duration, title.
         ranked = sorted(
-            (task for task in source_tasks if not task.completed),
-            key=lambda task: (-task.priority_rank(), task.duration_minutes, task.title.lower()),
+            pending,
+            key=lambda task: (
+                _due_time_to_minutes(task.due_time),
+                -task.priority_rank(),
+                task.duration_minutes,
+                task.title.lower(),
+            ),
         )
 
         plan: list[dict[str, Any]] = []
@@ -150,7 +275,8 @@ class Scheduler:
             minutes_left -= task.duration_minutes
             current_time = end_time
 
-        return plan
+        warnings.extend(self.detect_plan_overlaps(plan))
+        return plan, warnings
 
     def explain_placement(self, task: Task, context: str) -> str:
         """Describe why a task was placed in the plan (for UI or logs)."""
