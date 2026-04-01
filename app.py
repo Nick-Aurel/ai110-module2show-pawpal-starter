@@ -4,6 +4,11 @@ import streamlit as st
 
 from pawpal_system import Owner, Pet, Scheduler, Task
 
+# Single scheduler instance per run; stateless and safe to reuse for sorting / warnings.
+def _scheduler() -> Scheduler:
+    return Scheduler()
+
+
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 
 st.title("🐾 PawPal+")
@@ -18,6 +23,8 @@ so they survive Streamlit reruns. Use **Add pet** / **Add task** to call **`add_
 # --- Phase 3: persist Owner across reruns (Streamlit re-executes the script each interaction) ---
 if "owner" not in st.session_state:
     st.session_state.owner = Owner(name="Jordan", minutes_available_today=90)
+if "task_complete_flash" not in st.session_state:
+    st.session_state.task_complete_flash = ""
 
 owner: Owner = st.session_state.owner
 
@@ -75,13 +82,21 @@ else:
 st.divider()
 
 st.subheader("Tasks")
-st.caption("Pick a pet, then **Add task** calls **`Pet.add_task(Task(...))`**.")
+st.caption(
+    "Pick a pet, then **Add task** calls **`Pet.add_task(Task(...))`**. "
+    "Pending tasks are shown **sorted by due time** via **`Scheduler.sort_tasks_by_time`**."
+)
 if not pets:
     st.warning("Add a pet first so tasks can be attached.")
 else:
     pet_labels = [f"{p.name} ({p.species})" for p in pets]
     choice = st.selectbox("Pet for this task", range(len(pets)), format_func=lambda i: pet_labels[i])
     selected_pet = pets[choice]
+    scheduler = _scheduler()
+
+    if st.session_state.task_complete_flash:
+        st.success(st.session_state.task_complete_flash)
+        st.session_state.task_complete_flash = ""
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -129,26 +144,72 @@ else:
             st.warning(str(e))
 
     pending = [t for t in selected_pet.get_tasks() if not t.completed]
-    if pending:
-        st.write(f"**Tasks for {selected_pet.name}**")
+    sorted_pending = scheduler.sort_tasks_by_time(pending)
+    conflict_notes = scheduler.find_due_time_conflicts(selected_pet.get_tasks())
+
+    if conflict_notes:
+        st.warning(
+            "**Due-time overlap on your list**\n\n"
+            + "Two or more *pending* tasks share the same clock time. "
+            "Stagger times (or finish one before the other) so you are not double-booked.\n\n"
+            + "\n\n".join(f"- {note}" for note in conflict_notes)
+        )
+
+    if sorted_pending:
+        st.success(f"**Pending for {selected_pet.name}** — earliest due time first (tasks without a time appear last).")
         st.table(
             [
                 {
+                    "Due": t.due_time or "—",
                     "Title": t.title,
-                    "Minutes": t.duration_minutes,
+                    "Min": t.duration_minutes,
                     "Priority": t.priority,
+                    "Repeat": t.recurrence or "—",
                     "Summary": t.summary(),
                 }
-                for t in pending
+                for t in sorted_pending
             ]
         )
+
+        st.markdown("**Mark a task done** — daily/weekly tasks spawn the next occurrence automatically.")
+        labels = [
+            f"{t.title} @ {t.due_time or 'no time'} ({t.priority})"
+            for t in sorted_pending
+        ]
+        pick = st.selectbox("Choose task", range(len(sorted_pending)), format_func=lambda i: labels[i], key="complete_pick")
+        if st.button("Mark complete", key="complete_btn"):
+            task = sorted_pending[pick]
+            try:
+                nxt = selected_pet.finalize_recurring_task(task)
+                if nxt:
+                    st.session_state.task_complete_flash = (
+                        f"Completed “{task.title}”. Next {nxt.recurrence} instance due **{nxt.due_date}**."
+                    )
+                else:
+                    st.session_state.task_complete_flash = f"Marked “{task.title}” complete."
+                st.rerun()
+            except ValueError as e:
+                st.warning(str(e))
     else:
         st.info(f"No pending tasks on **{selected_pet.name}** yet.")
 
 st.divider()
 
 st.subheader("Build schedule")
-st.caption("Uses **`Scheduler.build_plan`** across all pets on this owner.")
+st.caption(
+    "Uses **`Scheduler.build_plan`** and **`find_due_time_conflicts`** across all pets on this owner."
+)
+owner_wide = _scheduler().find_due_time_conflicts(owner.get_all_tasks())
+# Avoid duplicating the same warnings already shown for the selected pet when there is only one pet.
+if owner_wide and len(pets) > 1:
+    with st.expander("Due-time warnings (all pets)", expanded=True):
+        st.markdown(
+            "These messages come from the same conflict check as above, but **every pet** is included "
+            "before you generate a single combined schedule."
+        )
+        for note in owner_wide:
+            st.warning(note)
+
 start_time = st.text_input("Day start (HH:MM)", value="08:00", key="schedule_start")
 
 if st.button("Generate schedule"):
@@ -157,8 +218,8 @@ if st.button("Generate schedule"):
     except ValueError:
         st.warning("Use 24-hour **HH:MM** (e.g. `08:00`).")
     else:
-        scheduler = Scheduler()
-        plan, phase4_warnings = scheduler.build_plan(owner, start_time=start_time.strip())
+        sched = _scheduler()
+        plan, phase4_warnings = sched.build_plan(owner, start_time=start_time.strip())
         if phase4_warnings:
             st.warning("\n\n".join(phase4_warnings))
         if plan:

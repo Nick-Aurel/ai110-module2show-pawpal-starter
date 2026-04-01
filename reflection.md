@@ -51,6 +51,7 @@ classDiagram
         +list tasks
         +add_task(Task) void
         +get_tasks() list
+        +finalize_recurring_task(Task) Task
     }
 
     class Task {
@@ -58,25 +59,36 @@ classDiagram
         +int duration_minutes
         +str priority
         +bool completed
+        +str due_time
+        +str recurrence
+        +date due_date
         +duration() int
         +priority_rank() int
         +summary() str
         +mark_complete() void
+        +spawn_next_occurrence() Task
+    }
+
+    class Scheduler {
+        +sort_tasks_by_time(list) list
+        +find_due_time_conflicts(list) list
+        +build_plan(Owner, Pet, tasks) tuple
+        +explain_placement(Task, str) str
     }
 
     class DailyPlanner {
-        +build_plan() object
-        +explain_placement() str
+        <<Scheduler subclass>>
     }
 
     Owner "1" --> "*" Pet : has
     Pet "1" --> "*" Task : has
-    DailyPlanner ..> Owner : reads
-    DailyPlanner ..> Pet : reads
-    DailyPlanner ..> Task : orders and schedules
+    Scheduler ..> Owner : reads
+    Scheduler ..> Pet : reads
+    Scheduler ..> Task : orders and schedules
+    DailyPlanner --|> Scheduler
 ```
 
-**Review:** The relationships match the domain: **Owner has Pets**, **Pet has Tasks**, and **DailyPlanner** depends on all three without owning them. The code implements scheduling in a **`Scheduler`** class (with **`DailyPlanner`** as a subclass); **`build_plan`** returns a list of structured entries (times, task, priority, reason).
+**Review:** The relationships match the domain: **Owner has Pets**, **Pet has Tasks**, and **Scheduler** (alias **DailyPlanner**) depends on all three without owning them. A raster summary of this structure is saved as **`uml_final.png`** in the repo root. **`build_plan`** returns a list of structured entries (start, end, task, priority, reason).
 
 **a. Initial design**
 
@@ -100,7 +112,8 @@ Structurally, this separates **data** (Owner → Pet → Task) from **behavior**
 - **Getter stubs:** `get_pets`, `get_tasks`, and `available_minutes` used to fall through with `pass` and would have returned `None` by mistake; they now return the underlying values.
 - **Task helpers:** `duration`, `priority_rank`, and `summary` are implemented with simple rules so sorting and UI strings work; unknown priority strings default to a middle rank.
 - **Potential bottleneck (documented, not a bug):** `build_plan(owner, pet, tasks)` takes both `pet` and a separate `tasks` list. That could duplicate `pet.tasks` if callers are careless. The class docstring notes that callers should pass the same tasks they associate with the pet (e.g. `pet.get_tasks()`) until we refactor to a single source of truth.
-- **Scheduling:** `Scheduler.build_plan` and `explain_placement` are implemented in `pawpal_system.py` and exercised from **`main.py`**. **`app.py`** is still the course **starter** Streamlit shell (tasks as dicts, “Generate schedule” not wired)—**Phase 6 UI polish** is intentionally not done yet so skipped modules can be completed first.
+- **Scheduling:** `Scheduler.build_plan` and `explain_placement` live in `pawpal_system.py` and are exercised from **`main.py`** and **`app.py`**.
+- **Phase 6 UI:** **`app.py`** now surfaces the algorithmic layer: pending tasks are shown with **`sort_tasks_by_time`**, **`find_due_time_conflicts`** warns when two pending tasks share a due time (per pet and, when there are multiple pets, in an expander for all-pet conflicts), **Mark complete** calls **`finalize_recurring_task`**, and **Generate schedule** uses **`build_plan`** with the same warning stream as the CLI.
 
 
 ---
@@ -123,13 +136,15 @@ That tradeoff is **reasonable** for a teaching MVP: pet owners get a clear signa
 
 **a. How you used AI**
 
-- How did you use AI tools during this project (for example: design brainstorming, debugging, refactoring)?
-- What kinds of prompts or questions were most helpful?
+I used **Cursor** (inline chat and agent mode) the way the course describes **Copilot Chat**: scoped questions with **`#codebase`** / open files for UML drafts, test ideas, and refactors. The most helpful prompts were **concrete and bounded**—for example, “Given `Scheduler.build_plan`, what invariants should tests assert?” and “Update `app.py` to call `sort_tasks_by_time` without duplicating sort logic in the UI.” Broad “write the whole app” requests were less useful than **stepwise** ones tied to a single file or behavior.
 
 **b. Judgment and verification**
 
-- Describe one moment where you did not accept an AI suggestion as-is.
-- How did you evaluate or verify what the AI suggested?
+One suggestion was to **merge `Owner` and `Scheduler` into one “god” class** for fewer files. I rejected that to keep **separation of concerns**: domain objects (`Owner`, `Pet`, `Task`) stay stable while scheduling rules live in **`Scheduler`**, which keeps tests small and the Streamlit layer thin. I verified changes by running **`python -m pytest`**, exercising **`main.py`**, and clicking through **`streamlit run app.py`** after UI edits.
+
+**c. Phases and chat organization**
+
+Using **separate chat threads** (or a fresh session) per phase—design vs implementation vs tests vs UI—reduced context drift. Earlier messages about UML did not pollute later debugging sessions, and test generation did not overwrite mental model of `build_plan` edge cases.
 
 ---
 
@@ -137,13 +152,11 @@ That tradeoff is **reasonable** for a teaching MVP: pet owners get a clear signa
 
 **a. What you tested**
 
-- What behaviors did you test?
-- Why were these tests important?
+Automated tests in **`tests/test_pawpal.py`** cover: task completion and pet task lists; **chronological sorting** by `due_time`; **daily recurrence** spawning the next day via **`finalize_recurring_task`**; and **duplicate due-time conflict** messages from **`find_due_time_conflicts`**. These matter because they guard the **behaviors users see** in the UI (ordered lists, warnings, recurring water/meds-style tasks) without needing Streamlit in CI.
 
 **b. Confidence**
 
-- How confident are you that your scheduler works correctly?
-- What edge cases would you test next if you had more time?
+I am **reasonably confident** (about **4/5**) in the paths covered by tests and manual checks. Next I would add tests for **weekly** recurrence, **`build_plan`** when the time budget excludes long tasks, and **`detect_plan_overlaps`** if the planner’s ordering ever changes.
 
 ---
 
@@ -151,12 +164,20 @@ That tradeoff is **reasonable** for a teaching MVP: pet owners get a clear signa
 
 **a. What went well**
 
-- What part of this project are you most satisfied with?
+The split between **data** (`Owner` / `Pet` / `Task`) and **scheduling** (`Scheduler`) made it straightforward to add **Phase 6** UI features without rewriting core logic: the app only had to **call existing methods** and present warnings clearly.
 
 **b. What you would improve**
 
-- If you had another iteration, what would you improve or redesign?
+I would introduce a small **`PlanEntry`** type (or typed dict) in code for schedule rows, and consider **persisting** session data (or export/import JSON) so a refresh does not drop the owner’s pets. I would also add **edit/remove task** flows in the UI.
 
 **c. Key takeaway**
 
-- What is one important thing you learned about designing systems or working with AI on this project?
+Acting as **lead architect** means **owning tradeoffs** (for example, duplicate due-time vs duration overlap) while using AI for speed: the model proposes drafts, but **naming, boundaries, and verification** stay human responsibilities. Clear module boundaries made AI-assisted changes safer because each suggestion could be tested in isolation.
+
+---
+
+## 6. Lead architect role (AI-assisted workflow)
+
+**What “lead” meant here:** I set **non-negotiables**—four domain classes, a stateless scheduler, Streamlit only as a view—and used AI to **draft** Mermaid, tests, and UI wiring. I **reviewed** every cross-cutting change against `pawpal_system.py` so the diagram, README, and app stayed aligned.
+
+**Conflict warnings in the UI:** When **`Scheduler`** flags a conflict, the most helpful presentation is **early, plain language, and actionable**: say *that* two tasks share a time, *which* titles, and *what to do* (stagger times or complete one first). Using **`st.warning`** with short bullets matches how busy owners scan the page—better than burying the same text only inside the generated schedule.
